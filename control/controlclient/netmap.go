@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,7 +157,17 @@ func (nm *NetworkMap) UserMap() map[string][]filter.IP {
 }
 
 var iOS = runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64")
-var keepalive = !iOS
+var keepalive = (func() bool {
+	if iOS {
+		return false
+	}
+	// Temporary (2020-02-21) knob to force debug, during DERP testing:
+	derp, _ := strconv.ParseBool(os.Getenv("DEBUG_FORCE_DERP"))
+	if derp {
+		return false
+	}
+	return true
+})()
 
 const (
 	UAllowSingleHosts = 1 << iota

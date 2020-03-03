@@ -30,6 +30,9 @@ import (
 	"tailscale.com/types/logger"
 )
 
+// DefaultTLSConfig is the base *tls.Config used by a DERP Client.
+var DefaultTLSConfig = &tls.Config{}
+
 // Client is a DERP-over-HTTP client.
 //
 // It automatically reconnects on error retry. That is, a failed Send or
@@ -167,7 +170,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 
 	var httpConn net.Conn // a TCP conn or a TLS conn; what we speak HTTP to
 	if c.url.Scheme == "https" {
-		httpConn = tls.Client(tcpConn, &tls.Config{ServerName: c.url.Host})
+		tlsConfig := DefaultTLSConfig.Clone()
+		tlsConfig.ServerName = c.url.Host
+		httpConn = tls.Client(tcpConn, tlsConfig)
 	} else {
 		httpConn = tcpConn
 	}

@@ -6,9 +6,13 @@ package magicsock
 
 import (
 	"bytes"
+	crand "crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +21,10 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"github.com/tailscale/wireguard-go/wgcfg"
+	"tailscale.com/derp"
+	"tailscale.com/derp/derphttp"
 	"tailscale.com/stun"
+	"tailscale.com/types/key"
 )
 
 func TestListen(t *testing.T) {
@@ -177,6 +184,7 @@ func makeConfigs(t *testing.T, ports []uint16) []wgcfg.Config {
 					Host: "127.0.0.1",
 					Port: port,
 				}},
+				PersistentKeepalive: 25,
 			}
 			cfg.Peers = append(cfg.Peers, peer)
 		}
@@ -192,6 +200,41 @@ func parseCIDR(t *testing.T, addr string) wgcfg.CIDR {
 		t.Fatal(err)
 	}
 	return *cidr
+}
+
+func runDERP(t *testing.T) (*derp.Server, string, *http.Client) {
+	var serverPrivateKey key.Private
+	if _, err := crand.Read(serverPrivateKey[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	s := derp.NewServer(serverPrivateKey, t.Logf)
+	t.Cleanup(func() { s.Close() })
+	// TODO: cleanup httpsrv.CloseClientConnections / Close
+
+	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(s))
+	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	httpsrv.StartTLS()
+	t.Logf("DERP server URL: %s", httpsrv.URL)
+
+	addr := strings.TrimPrefix(httpsrv.URL, "https://")
+
+	/*ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL := "http://" + ln.Addr().String()
+
+	go func() {
+		if err := httpsrv.Serve(ln); err != nil {
+			if err == http.ErrServerClosed {
+				return
+			}
+			panic(err)
+		}
+	}()*/
+
+	return s, addr, httpsrv.Client()
 }
 
 func TestTwoDevicePing(t *testing.T) {
@@ -224,10 +267,10 @@ func TestTwoDevicePing(t *testing.T) {
 	ports := []uint16{conn1.LocalPort(), conn2.LocalPort()}
 	cfgs := makeConfigs(t, ports)
 
-	uapi1, _ := cfgs[0].ToUAPI()
-	t.Logf("cfg0: %v", uapi1)
-	uapi2, _ := cfgs[1].ToUAPI()
-	t.Logf("cfg1: %v", uapi2)
+	//uapi1, _ := cfgs[0].ToUAPI()
+	//t.Logf("cfg0: %v", uapi1)
+	//uapi2, _ := cfgs[1].ToUAPI()
+	//t.Logf("cfg1: %v", uapi2)
 
 	tun1 := tuntest.NewChannelTUN()
 	dev1 := device.NewDevice(tun1.TUN(), &device.DeviceOptions{
@@ -238,6 +281,9 @@ func TestTwoDevicePing(t *testing.T) {
 	})
 	dev1.Up()
 	//defer dev1.Close() TODO(crawshaw): this hangs
+	if err := conn1.SetPrivateKey(cfgs[0].PrivateKey); err != nil {
+		t.Fatal(err)
+	}
 	if err := dev1.Reconfig(&cfgs[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +297,10 @@ func TestTwoDevicePing(t *testing.T) {
 	})
 	dev2.Up()
 	//defer dev2.Close() TODO(crawshaw): this hangs
+	if err := conn2.SetPrivateKey(cfgs[1].PrivateKey); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := dev2.Reconfig(&cfgs[1]); err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +315,7 @@ func TestTwoDevicePing(t *testing.T) {
 			if !bytes.Equal(msg2to1, msgRecv) {
 				t.Error("ping did not transit correctly")
 			}
-		case <-time.After(1 * time.Second):
+		case <-time.After(3 * time.Second):
 			t.Error("ping did not transit")
 		}
 	}
@@ -279,7 +329,7 @@ func TestTwoDevicePing(t *testing.T) {
 			if !bytes.Equal(msg1to2, msgRecv) {
 				t.Error("return ping did not transit correctly")
 			}
-		case <-time.After(1 * time.Second):
+		case <-time.After(3 * time.Second):
 			t.Error("return ping did not transit")
 		}
 	}
@@ -296,7 +346,7 @@ func TestTwoDevicePing(t *testing.T) {
 			if !bytes.Equal(msg1to2, msgRecv) {
 				t.Error("return ping did not transit correctly")
 			}
-		case <-time.After(1 * time.Second):
+		case <-time.After(3 * time.Second):
 			t.Error("return ping did not transit")
 		}
 	})
@@ -309,9 +359,7 @@ func TestTwoDevicePing(t *testing.T) {
 		ping2(t)
 	})
 
-	t.Run("ping 1.0.0.1 x50", func(t *testing.T) {
-		const count = 50
-
+	pingSeq := func(t *testing.T, count int) {
 		msg := func(i int) []byte {
 			b := tuntest.Ping(net.ParseIP("1.0.0.2"), net.ParseIP("1.0.0.1"))
 			b[len(b)-1] = byte(i) // set seq num
@@ -330,9 +378,88 @@ func TestTwoDevicePing(t *testing.T) {
 				if !bytes.Equal(b, msgRecv) {
 					t.Errorf("return ping %d did not transit correctly", i)
 				}
-			case <-time.After(1 * time.Second):
+			case <-time.After(3 * time.Second):
 				t.Fatalf("return ping %d did not transit", i)
 			}
+		}
+
+	}
+
+	t.Run("ping 1.0.0.1 x50", func(t *testing.T) {
+		pingSeq(t, 50)
+	})
+
+	derpServer, derpAddr, derpClient := runDERP(t)
+	derphttp.DefaultTLSConfig = derpClient.Transport.(*http.Transport).TLSClientConfig
+	derphttp.DefaultTLSConfig.InsecureSkipVerify = true
+
+	// Wipe default derp list
+	derpHostOfIndex = map[int]string{}
+	derpIndexOfHost = map[string]int{}
+	addDerper(1, derpAddr)
+
+	// Add DERP relay.
+	derpEp := wgcfg.Endpoint{Host: "127.3.3.40", Port: 1}
+	ep0 := cfgs[0].Peers[0].Endpoints
+	ep0 = append([]wgcfg.Endpoint{derpEp}, ep0...)
+	cfgs[0].Peers[0].Endpoints = ep0
+	ep1 := cfgs[1].Peers[0].Endpoints
+	ep1 = append([]wgcfg.Endpoint{derpEp}, ep1...)
+	cfgs[1].Peers[0].Endpoints = ep1
+	if err := dev1.Reconfig(&cfgs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev2.Reconfig(&cfgs[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("add DERP", func(t *testing.T) {
+		defer func() {
+			t.Logf("DERP vars: %s", derpServer.ExpVar().String())
+		}()
+		pingSeq(t, 20)
+	})
+
+	// Disable real route.
+	cfgs[0].Peers[0].Endpoints = []wgcfg.Endpoint{derpEp}
+	cfgs[1].Peers[0].Endpoints = []wgcfg.Endpoint{derpEp}
+	if err := dev1.Reconfig(&cfgs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev2.Reconfig(&cfgs[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("all traffic over DERP", func(t *testing.T) {
+		defer func() {
+			t.Logf("DERP vars: %s", derpServer.ExpVar().String())
+			if t.Failed() {
+				uapi1, _ := cfgs[0].ToUAPI()
+				t.Logf("cfg0: %v", uapi1)
+				uapi2, _ := cfgs[1].ToUAPI()
+				t.Logf("cfg1: %v", uapi2)
+			}
+		}()
+		pingSeq(t, 20)
+	})
+
+	// Put one real route.
+	cfgs[0].Peers[0].Endpoints = ep0
+	if ep2 := cfgs[1].Peers[0].Endpoints; len(ep2) != 1 {
+		t.Errorf("unexpected peer endpoints in dev2: %v", ep2)
+	}
+	if err := dev1.Reconfig(&cfgs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev2.Reconfig(&cfgs[1]); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("one real route is enough thanks to spray", func(t *testing.T) {
+		pingSeq(t, 50)
+
+		ep2 := dev2.Config().Peers[0].Endpoints
+		if len(ep2) != 2 {
+			t.Error("handshake spray failed to find real route")
 		}
 	})
 }

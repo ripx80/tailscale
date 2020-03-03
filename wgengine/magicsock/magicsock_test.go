@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"tailscale.com/stun"
 )
 
 func TestListen(t *testing.T) {
@@ -20,14 +23,12 @@ func TestListen(t *testing.T) {
 		}
 	}
 
-	// TODO(crawshaw): break test dependency on the network
-	// using "gortc.io/stun" (like stunner_test.go).
-	stunServers := DefaultSTUN
+	stunAddr := serveSTUN(t)
 
 	port := pickPort(t)
 	conn, err := Listen(Options{
 		Port:          port,
-		STUN:          stunServers,
+		STUN:          []string{stunAddr.String()},
 		EndpointsFunc: epFunc,
 	})
 	if err != nil {
@@ -75,5 +76,60 @@ func pickPort(t *testing.T) uint16 {
 func TestDerpIPConstant(t *testing.T) {
 	if derpMagicIPStr != derpMagicIP.String() {
 		t.Errorf("str %q != IP %v", derpMagicIPStr, derpMagicIP)
+	}
+}
+
+type stunStats struct {
+	mu       sync.Mutex
+	readIPv4 int
+	readIPv6 int
+}
+
+func serveSTUN(t *testing.T) net.Addr {
+	t.Helper()
+
+	// TODO(crawshaw): use stats to test re-STUN logic
+	var stats stunStats
+
+	pc, err := net.ListenPacket("udp4", ":3478")
+	if err != nil {
+		t.Fatalf("failed to open STUN listener: %v", err)
+	}
+	t.Cleanup(func() { pc.Close() })
+
+	go runSTUN(pc, &stats)
+	return pc.LocalAddr()
+}
+
+func runSTUN(pc net.PacketConn, stats *stunStats) {
+	var buf [64 << 10]byte
+	for {
+		n, addr, err := pc.ReadFrom(buf[:])
+		if err != nil {
+			continue
+		}
+		ua, ok := addr.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+		pkt := buf[:n]
+		if !stun.Is(pkt) {
+			continue
+		}
+		txid, err := stun.ParseBindingRequest(pkt)
+		if err != nil {
+			continue
+		}
+
+		stats.mu.Lock()
+		if ua.IP.To4() != nil {
+			stats.readIPv4++
+		} else {
+			stats.readIPv6++
+		}
+		stats.mu.Unlock()
+
+		res := stun.Response(txid, ua.IP, uint16(ua.Port))
+		_, err = pc.WriteTo(res, addr)
 	}
 }

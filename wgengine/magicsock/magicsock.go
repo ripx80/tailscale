@@ -28,9 +28,12 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/interfaces"
+	"tailscale.com/netcheck"
 	"tailscale.com/stun"
 	"tailscale.com/stunner"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/version"
 )
 
@@ -65,6 +68,10 @@ type Conn struct {
 	// stunReceiveFunc holds the current STUN packet processing func.
 	// Its Loaded value is always non-nil.
 	stunReceiveFunc atomic.Value // of func(p []byte, fromAddr *net.UDPAddr)
+
+	netInfoMu   sync.Mutex
+	netInfoFunc func(*tailcfg.NetInfo) // nil until set
+	netInfoLast *tailcfg.NetInfo
 
 	udpRecvCh  chan udpReadResult
 	derpRecvCh chan derpReadResult
@@ -204,6 +211,9 @@ func (c *Conn) epUpdate(ctx context.Context) {
 
 		go func() {
 			defer close(lastDone)
+
+			c.updateNetInfo() // best effort
+
 			nearestDerp, endpoints, err := c.determineEndpoints(epCtx)
 			if err != nil {
 				c.logf("magicsock.Conn: endpoint update failed: %v", err)
@@ -219,6 +229,66 @@ func (c *Conn) epUpdate(ctx context.Context) {
 			// TODO(bradfiz): get nearestDerp back to ipn for a HostInfo update
 			c.epFunc(endpoints)
 		}()
+	}
+}
+
+func (c *Conn) updateNetInfo() {
+	logf := logger.WithPrefix(c.logf, "updateNetInfo: ")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	report, err := netcheck.GetReport(ctx, logf)
+	if err != nil {
+		logf("GetReport: %v", err)
+		return
+	}
+
+	ni := &tailcfg.NetInfo{
+		DERPLatency:           map[string]float64{},
+		MappingVariesByDestIP: report.MappingVariesByDestIP,
+		HairPinning:           report.HairPinning,
+	}
+	for server, d := range report.DERPLatency {
+		ni.DERPLatency[server] = d.Seconds()
+	}
+	ni.WorkingIPv6.Set(report.IPv6)
+	ni.WorkingUDP.Set(report.UDP)
+	ni.PreferredDERP = report.PreferredDERP
+
+	// TODO: set link type
+
+	c.callNetInfoCallback(ni)
+}
+
+// callNetInfoCallback calls the NetInfo callback (if previously
+// registered with SetNetInfoCallback) if ni has substantially changed
+// since the last state.
+//
+// callNetInfoCallback takes ownership of ni.
+func (c *Conn) callNetInfoCallback(ni *tailcfg.NetInfo) {
+	c.netInfoMu.Lock()
+	defer c.netInfoMu.Unlock()
+	if ni.BasicallyEqual(c.netInfoLast) {
+		return
+	}
+	c.netInfoLast = ni
+	if c.netInfoFunc != nil {
+		c.logf("netInfo update: %+v", ni)
+		go c.netInfoFunc(ni)
+	}
+}
+
+func (c *Conn) SetNetInfoCallback(fn func(*tailcfg.NetInfo)) {
+	if fn == nil {
+		panic("nil NetInfoCallback")
+	}
+	c.netInfoMu.Lock()
+	last := c.netInfoLast
+	c.netInfoFunc = fn
+	c.netInfoMu.Unlock()
+
+	if last != nil {
+		fn(last)
 	}
 }
 

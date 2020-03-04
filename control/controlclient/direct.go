@@ -176,6 +176,21 @@ func (c *Direct) SetHostinfo(hi *tailcfg.Hostinfo) {
 	c.hostinfo = hi.Clone()
 }
 
+// SetNetInfo clones the provided NetInfo and remembers it for the
+// next update.
+func (c *Direct) SetNetInfo(ni *tailcfg.NetInfo) {
+	if ni == nil {
+		panic("nil NetInfo")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.logf("NetInfo: %v\n", ni)
+	if c.hostinfo != nil {
+		c.hostinfo.NetInfo = ni.Clone()
+	}
+}
+
 func (c *Direct) GetPersist() Persist {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -649,6 +664,12 @@ func encode(v interface{}, serverKey *wgcfg.Key, mkey *wgcfg.PrivateKey) ([]byte
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
+	}
+	const debugMapRequests = false
+	if debugMapRequests {
+		if _, ok := v.(tailcfg.MapRequest); ok {
+			log.Printf("MapRequest: %s", b)
+		}
 	}
 	var nonce [24]byte
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
